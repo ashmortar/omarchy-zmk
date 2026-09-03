@@ -1,0 +1,8 @@
+{"type":"a{oa{sa{sv}}}","data":[{
+"/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01":{"org.bluez.Device1":{"Address":{"type":"s","data":"AA:BB:CC:DD:EE:01"},"Alias":{"type":"s","data":"sleepy"},"Connected":{"type":"b","data":false},"Paired":{"type":"b","data":true},"Bonded":{"type":"b","data":true},"Trusted":{"type":"b","data":true},"WakeAllowed":{"type":"b","data":false},"Modalias":{"type":"s","data":"bluetooth:v1D50p615Ed0001"}}},
+"/org/bluez/hci0/dev_E2_D9_27_00_00_AA":{"org.bluez.Device1":{"Address":{"type":"s","data":"E2:D9:27:00:00:AA"},"Alias":{"type":"s","data":"lim\"inal"},"Connected":{"type":"b","data":true},"Paired":{"type":"b","data":true},"Bonded":{"type":"b","data":true},"Trusted":{"type":"b","data":true},"WakeAllowed":{"type":"b","data":true},"Modalias":{"type":"s","data":"bluetooth:v1D50p615Ed0001"}}},
+"/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0010/char0011":{"org.bluez.GattCharacteristic1":{"UUID":{"type":"s","data":"00002a19-0000-1000-8000-00805f9b34fb"},"Value":{"type":"ay","data":[100]}}},
+"/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0015/char0016":{"org.bluez.GattCharacteristic1":{"UUID":{"type":"s","data":"00002a19-0000-1000-8000-00805f9b34fb"},"Value":{"type":"ay","data":[95]}}},
+"/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0015/char0016/desc001a":{"org.bluez.GattDescriptor1":{"UUID":{"type":"s","data":"00002901-0000-1000-8000-00805f9b34fb"},"Value":{"type":"ay","data":[80,101,114,105,112,104,101,114,97,108,32,48]}}},
+"/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service001b/char0020":{"org.bluez.GattCharacteristic1":{"UUID":{"type":"s","data":"00002a50-0000-1000-8000-00805f9b34fb"},"Value":{"type":"ay","data":[1,80,29,94,97,1,0]}}}
+}]}

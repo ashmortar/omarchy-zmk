@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "id": "ashmortar.zmk",
+  "name": "ZMK keyboard",
+  "version": "1.0.0",
+  "author": "ashmortar",
+  "license": "MIT",
+  "description": "ZMK keyboard status for the Omarchy bar: Bluetooth or USB transmission path, per-piece battery over BLE GATT, charging, and a detail popup",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "ZMK keyboard",
+    "description": "Connection path, per-piece battery, and charging for a ZMK keyboard. Left click opens the popup; right click toggles percentages; middle click refreshes.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "lowThreshold": 15,
+      "macAddress": "",
+      "usbId": "1D50:615E",
+      "deviceName": "",
+      "showPercent": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 10,
+        "max": 600,
+        "step": 10,
+        "defaultValue": 10
+      },
+      {
+        "key": "lowThreshold",
+        "type": "integer",
+        "label": "Low battery threshold (%)",
+        "min": 5,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "macAddress",
+        "type": "string",
+        "label": "Bluetooth MAC (leave empty to auto-detect)",
+        "defaultValue": ""
+      },
+      {
+        "key": "usbId",
+        "type": "string",
+        "label": "USB VID:PID",
+        "defaultValue": "1D50:615E"
+      },
+      {
+        "key": "deviceName",
+        "type": "string",
+        "label": "Display name until the board is seen",
+        "defaultValue": ""
+      },
+      {
+        "key": "showPercent",
+        "type": "boolean",
+        "label": "Show percentages in the bar",
+        "defaultValue": false
+      }
+    ]
+  }
+}

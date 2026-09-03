@@ -1,0 +1,623 @@
+#!/usr/bin/env bash
+# ZMK keyboard status readout for the omarchy-zmk bar widget. One run
+# prints one Waybar-style JSON line and exits:
+#   {"text","tooltip","class","found","connected","ble","cable","hid",
+#    "type","name","batteries":[{label,name,value,eta,charging}],
+#    "address","path","paired","bonded","trusted","wake","devid",
+#    "usbSerial","lastseen","error","warning"}
+# Battery values are read live over GATT and never cached, so a sleeping
+# keyboard reads "not connected" rather than stale percentages.
+#
+# Usage: zmk-status [MAC] [USB-VENDOR:PRODUCT] [LOW-THRESHOLD] [INTERVAL-SEC]
+# MAC pins one board when several are paired. Left empty, a connected
+# board wins over a paired one. Sourcing this file defines the functions
+# without running anything, which is how the tests use it.
+
+# The shell's PATH can carry user shims (version managers, wrappers). Only
+# system binaries run here. Tests point this at a directory of stubs.
+PATH="${ZMK_STATUS_PATH:-/usr/local/bin:/usr/bin:/bin}"
+export PATH
+NOTIFY_CMD="${ZMK_NOTIFY_CMD:-${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-notification-send}"
+
+ZMK_MAC="${1:-}"
+USB_HID_ID="${2:-1D50:615E}"
+LOW_THRESHOLD="${3:-15}"
+REFRESH_SEC="${4:-10}"
+BATT_LEVEL_UUID="00002a19-0000-1000-8000-00805f9b34fb"
+USER_DESC_UUID="00002901-0000-1000-8000-00805f9b34fb"
+PNP_ID_UUID="00002a50-0000-1000-8000-00805f9b34fb"
+# 48 hours: long enough for a slope, short enough that a change of habit
+# shows within a couple of days.
+HISTORY_WINDOW_SEC=172800
+STATE_ROOT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-zmk"
+INPUT_DEVICES_FILE="${INPUT_DEVICES_FILE:-/proc/bus/input/devices}"
+USB_DEVICES_DIR="${USB_DEVICES_DIR:-/sys/bus/usb/devices}"
+HID_DEVICES_DIR="${HID_DEVICES_DIR:-/sys/bus/hid/devices}"
+# sysfs names HID devices in uppercase hex and USB devices in lowercase.
+usb_id_upper=${USB_HID_ID^^}
+usb_id_lower=${USB_HID_ID,,}
+STATE_DIR=""
+cable_present=false
+hid_present=false
+# Set by the pinned-MAC check in main and by sample_input_paths when
+# python3 is missing. main never redeclares it as local, so those
+# assignments stick.
+warning=""
+
+# The host cannot see which side is central, so labels name roles, not
+# sides. A lone peripheral needs no index; several keep ZMK's numbering.
+battery_label() {
+	local raw="$1" count="$2"
+	if [ "$count" -le 1 ]; then printf '|'; return 0; fi
+	case "$raw" in
+		Peripheral\ *)
+			local n="${raw#Peripheral }"
+			if [ "$count" -le 2 ]; then printf 'P|Peripheral'; else printf 'P%s|Peripheral %s' "$n" "$n"; fi ;;
+		*) printf 'C|Central' ;;
+	esac
+}
+
+# Both links up: ZMK sends over whichever output is selected and only the
+# keystrokes reveal which, so the newer stamp wins. No stamp yet means
+# ZMK's own default, USB.
+decide_type() {
+	local hid="$1" ble="$2" usb_ts="$3" ble_ts="$4"
+	if [ "$hid" = "true" ] && [ "$ble" = "yes" ]; then
+		if [ "$ble_ts" -gt "$usb_ts" ]; then printf 'bluetooth'; else printf 'wired'; fi
+	elif [ "$hid" = "true" ]; then printf 'wired'
+	elif [ "$ble" = "yes" ]; then printf 'bluetooth'
+	else printf 'none'
+	fi
+}
+
+# Which piece charges is deterministic from where the cable lands: a
+# cabled central binds HID, a cabled peripheral never does. With several
+# peripherals the cabled one cannot be told apart, so none is flagged.
+charging_role() {
+	local role="$1" peripherals="$2"
+	[ "$cable_present" = "true" ] || { printf 'false'; return 0; }
+	if [ "$hid_present" = "true" ] && [ "$role" = "central" ]; then printf 'true'
+	elif [ "$hid_present" != "true" ] && [ "$role" = "peripheral" ] && [ "$peripherals" -le 1 ]; then printf 'true'
+	else printf 'false'
+	fi
+}
+
+humanize_hours() {
+	if [ "$1" -ge 48 ]; then printf '%dd' "$(($1 / 24))"; else printf '%dh' "$1"; fi
+}
+
+humanize_delta() {
+	local d="$1"
+	[ "$d" -lt 0 ] && d=0
+	if [ "$d" -lt 60 ]; then printf '%ds ago' "$d"
+	elif [ "$d" -lt 3600 ]; then printf '%dm ago' "$((d / 60))"
+	elif [ "$d" -lt 86400 ]; then printf '%dh ago' "$((d / 3600))"
+	else printf '%dd ago' "$((d / 86400))"
+	fi
+}
+
+# Junk in sysfs bcdDevice must not error inside the arithmetic hex expansion.
+usb_version_suffix() {
+	local bcd="$1"
+	[[ $bcd =~ ^[0-9A-Fa-f]{4}$ ]] || return 0
+	printf ' v%d.%d' "$((16#$bcd >> 8))" "$((16#$bcd & 0xFF))"
+}
+
+# One ObjectManager call carries every device, characteristic, descriptor,
+# and cached value, where per-property calls cost a process each. The env
+# override is how the tests feed a fixture instead of the live bus.
+# A process that ignores TERM would otherwise outlive its deadline, hence
+# -k on every timeout in this script. A hostile or enormous object tree
+# must not turn into unbounded parsing, hence the cap on both branches.
+load_objects() {
+	if [ -n "${BLUEZ_OBJECTS_FILE:-}" ]; then
+		cat "$BLUEZ_OBJECTS_FILE" 2>/dev/null
+	else
+		timeout -k 2 3 busctl call --json=short org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null
+	fi | head -c 2000000
+}
+
+# A pinned MAC wins. Otherwise a connected ZMK board beats a paired one,
+# so a second board in a drawer never shadows the one you're typing on.
+# Fields are joined with 0x1F rather than tab: tab is IFS whitespace, and
+# read would swallow an empty alias and shift every field after it.
+# Control bytes would end the row at read or shift its fields at the unit
+# separator, and angle brackets render as rich text in the shell's Text
+# items. POSIX class rather than a \u range: on jq 1.8.2 the range form
+# matched nearly every character. The alias is capped at 64 characters
+# after sanitizing: nothing longer fits the bar or the popup anyway, and
+# an unbounded alias is external input straight from a device the host
+# doesn't control.
+select_device() {
+	local objects="$1" mac="$2"
+	jq -r --arg mac "$mac" --arg vid "${usb_id_lower%%:*}" --arg pid "${usb_id_lower##*:}" '
+		[ .data[0] | to_entries[] | select(.value["org.bluez.Device1"] != null) ]
+		| map(select(
+			if $mac != "" then ((.value["org.bluez.Device1"].Address.data // "") | ascii_upcase) == ($mac | ascii_upcase)
+			else ((.value["org.bluez.Device1"].Modalias.data // "") | ascii_downcase | contains("v" + $vid + "p" + $pid)) end))
+		| (map(select(.value["org.bluez.Device1"].Connected.data == true)) + .)
+		| .[0] // empty
+		| .value["org.bluez.Device1"] as $d
+		| [ .key, ($d.Address.data // ""), (($d.Alias.data // "") | gsub("[[:cntrl:]<>]"; "") | .[0:64]), (($d.Connected.data // false) | tostring), (($d.Paired.data // false) | tostring), (($d.Bonded.data // false) | tostring), (($d.Trusted.data // false) | tostring), (($d.WakeAllowed.data // false) | tostring) ]
+		| join("\u001f")' <<<"$objects" 2>/dev/null
+}
+
+# The descriptor path rides along because BlueZ only caches a descriptor's
+# value after something has read it once. ZMK boards have one to a few
+# battery instances; anything beyond eight is not a keyboard we understand,
+# and each instance costs a GATT read.
+battery_chars() {
+	local objects="$1" dev="$2"
+	jq -r --arg dev "$dev" --arg uuid "$BATT_LEVEL_UUID" --arg desc "$USER_DESC_UUID" '
+		.data[0] as $o
+		| [ $o | to_entries[] | select(.key | startswith($dev + "/")) | select(.value["org.bluez.GattCharacteristic1"].UUID.data == $uuid) | .key ] | sort | .[0:8]
+		| .[] as $c
+		| ([ $o | to_entries[] | select(.key | startswith($c + "/")) | select(.value["org.bluez.GattDescriptor1"].UUID.data == $desc) ] | .[0]) as $d
+		| [ $c, ((($d.value["org.bluez.GattDescriptor1"].Value.data // []) | implode) | gsub("[[:cntrl:]<>]"; "")), ($d.key // "") ]
+		| join("\u001f")' <<<"$objects" 2>/dev/null
+}
+
+pnp_char() {
+	local objects="$1" dev="$2"
+	jq -r --arg dev "$dev" --arg uuid "$PNP_ID_UUID" '
+		.data[0] | to_entries[] | select(.key | startswith($dev + "/")) | select(.value["org.bluez.GattCharacteristic1"].UUID.data == $uuid)
+		| [ .key, ((.value["org.bluez.GattCharacteristic1"].Value.data // []) | map(tostring) | join(" ")) ]
+		| join("\u001f")' <<<"$objects" 2>/dev/null | head -n 1
+}
+
+# 0003 is USB, 0005 is Bluetooth. The mouse node shares the id but has no
+# kbd handler.
+input_node_for_bus() {
+	awk -v bus="$1" -v vid="${usb_id_lower%%:*}" -v pid="${usb_id_lower##*:}" 'BEGIN { RS = "" }
+		$0 ~ ("Bus=" bus " Vendor=" vid " Product=" pid) && /Handlers=.*kbd/ {
+			match($0, /event[0-9]+/)
+			print "/dev/input/" substr($0, RSTART, RLENGTH)
+			exit
+		}' "$INPUT_DEVICES_FILE" 2>/dev/null
+}
+
+# One second short of the poll interval, so the next poll re-arms the
+# reader with no gap. Capped so a long interval can't leave a stale reader
+# blocking a shorter one after a settings change.
+sample_window_sec() {
+	local w=$(($1 - 1))
+	# Only reachable from the command line: the widget never passes under 10.
+	[ "$w" -lt 2 ] && w=2
+	[ "$w" -gt 60 ] && w=60
+	printf '%d' "$w"
+}
+
+# Only a numeric pid whose command line is the reader counts; a tampered
+# or recycled pid must not park path detection on "wired" forever. The
+# backgrounded subshell has a single command, so bash execs straight into
+# it rather than forking one more layer: $! is the timeout process itself.
+# A recycled pid running some other python would otherwise pass, and the
+# state dir passed as the reader's first argument is unique to this
+# reader, so matching it in the cmdline is the reliable check.
+reader_alive() {
+	local pidfile="$1"
+	local pid; pid=$(cat "$pidfile" 2>/dev/null)
+	[[ $pid =~ ^[0-9]+$ ]] && grep -q -a -F -- "$STATE_DIR" "/proc/$pid/cmdline" 2>/dev/null
+}
+
+# One reader for both nodes: a second interpreter start costs more than
+# the read itself, and watching both means an output toggle mid-window is
+# caught. EV_KEY only, because the host echoes LED writes to every
+# keyboard node and those would stamp both paths at once. Never
+# re-spawned while one is alive; timeout is what ends it.
+sample_input_paths() {
+	command -v python3 >/dev/null 2>&1 || { warning="python3 missing, keystroke path unknown"; return 0; }
+	local -a args=()
+	[ -n "$1" ] && [ -r "$1" ] && args+=("usb=$1")
+	[ -n "$2" ] && [ -r "$2" ] && args+=("ble=$2")
+	[ "${#args[@]}" -gt 0 ] || return 0
+	local pidfile="$STATE_DIR/inpath.pid"
+	reader_alive "$pidfile" && return 0
+	(
+		timeout -k 2 "$(sample_window_sec "$REFRESH_SEC")" python3 - "$STATE_DIR" "${args[@]}" <<-'PY'
+		import os, select, struct, sys, time
+		nodes = {}
+		for arg in sys.argv[2:]:
+		    path, node = arg.split("=", 1)
+		    try:
+		        nodes[os.open(node, os.O_RDONLY | os.O_NONBLOCK)] = path
+		    except OSError:
+		        pass
+		if not nodes:
+		    sys.exit(1)
+		stamp_dir = sys.argv[1]
+		last = {}
+		# 24 bytes and "llHHi" are struct input_event on 64-bit Linux: two
+		# longs (seconds, microseconds) then two unsigned shorts and an int.
+		while True:
+		    ready, _, _ = select.select(list(nodes), [], [])
+		    for fd in ready:
+		        try:
+		            data = os.read(fd, 24 * 64)
+		        except BlockingIOError:
+		            continue
+		        except OSError:
+		            sys.exit(1)
+		        if not data:
+		            sys.exit(1)
+		        now = time.time()
+		        for i in range(0, len(data) - 23, 24):
+		            if struct.unpack_from("llHHi", data, i)[2] != 1:
+		                continue
+		            path = nodes[fd]
+		            # A fast typist would otherwise rewrite the stamp file
+		            # hundreds of times a second.
+		            if now - last.get(path, 0) < 0.5:
+		                break
+		            last[path] = now
+		            tmp = os.path.join(stamp_dir, "inpath." + path + ".tmp")
+		            with open(tmp, "w") as f:
+		                f.write(str(int(now * 1000)))
+		            os.replace(tmp, os.path.join(stamp_dir, "inpath." + path))
+		            # One stamp per chunk per path, for the same reason.
+		            break
+		PY
+	) </dev/null >/dev/null 2>&1 &
+	printf '%s\n' "$!" > "$pidfile"
+}
+
+# busctl prints "ay <len>" before the bytes, hence dropping the first two
+# fields. A battery read passes a shorter deadline because it retries, so
+# it also gets a shorter kill-after.
+read_byte_array() {
+	local path="$1" interface="$2" deadline="${3:-3}"
+	local kill_after=2
+	[ "$deadline" = 2 ] && kill_after=1
+	timeout -k "$kill_after" "$deadline" busctl call org.bluez "$path" "$interface" ReadValue 'a{sv}' 0 2>/dev/null \
+		| awk '{ $1 = ""; $2 = ""; sub(/^  /, ""); print }'
+}
+
+read_bytes_as_text() {
+	read_byte_array "$1" "$2" | awk '{ for (i = 1; i <= NF; i++) printf "%c", $i }'
+}
+
+# GATT reads can fail for a moment right after the link comes up, so one
+# retry. The budget is small so a split with failing reads still finishes
+# inside the widget's 30-second watchdog.
+read_battery_level() {
+	local v="" attempt
+	for attempt in 1 2; do
+		# Several battery instances retry in turn; past 12 s the watchdog is too close.
+		[ "$SECONDS" -lt 12 ] || break
+		v=$(read_byte_array "$1" org.bluez.GattCharacteristic1 2)
+		[ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
+		[ "$attempt" -lt 2 ] && sleep 0.3
+	done
+}
+
+# Bounded so a hung notification daemon can't block a poll, and the flag
+# is only set once the send actually succeeds, so a missing daemon never
+# consumes the crossing.
+low_notify() {
+	local slot="$1" subject="$2" value="$3"
+	if [ "$value" -le "$LOW_THRESHOLD" ]; then
+		if [ ! -e "$STATE_DIR/$slot.notified" ]; then
+			timeout -k 1 3 "$NOTIFY_CMD" "ZMK: ${subject} battery at ${value}%, charge soon" 2>/dev/null \
+				&& touch "$STATE_DIR/$slot.notified"
+		fi
+	elif [ "$value" -ge $((LOW_THRESHOLD + 5)) ]; then
+		rm -f "$STATE_DIR/$slot.notified"
+	fi
+}
+
+# Charging would flatten the slope, so cabled readings are skipped and a
+# long cabled stretch resets the file. A row under three seconds old came
+# from the other bar instance, not a new sample. Only the first and last
+# rows feed the estimate, so an unchanged value is worth recording at most
+# every five minutes.
+record_history() {
+	local slot="$1" value="$2"
+	local hist="$STATE_DIR/$slot.history"
+	# A kill between the write and the rename can leave one of these
+	# behind. Only files older than a minute are swept, and only the
+	# numeric-suffixed temp files, never the history itself: two bar
+	# instances poll the same directory, so a fresh one could belong to a
+	# sibling still between its own awk and mv.
+	find "$STATE_DIR" -maxdepth 1 -name "$slot.history.[0-9]*" -mmin +1 -delete 2>/dev/null
+	local now; now=$(date +%s)
+	local lastts lastval
+	read -r lastts lastval < <(tail -n 1 "$hist" 2>/dev/null)
+	if [ -n "$lastval" ] && [ "$value" -gt "$((lastval + 1))" ]; then
+		# A rise means a charge happened, so the old slope is meaningless.
+		: > "$hist"
+		lastts=""
+		lastval=""
+	fi
+	if [ "$cable_present" = "true" ]; then
+		if [ -z "$lastts" ] || [ $((now - lastts)) -gt 21600 ]; then
+			: > "$hist"
+		fi
+		return 0
+	fi
+	if [ -n "$lastts" ] && [ $((now - lastts)) -lt 3 ]; then
+		return 0
+	fi
+	if [ -n "$lastts" ] && [ "$lastval" = "$value" ] && [ $((now - lastts)) -lt 300 ]; then
+		return 0
+	fi
+	printf '%s %s\n' "$now" "$value" >> "$hist"
+	local cut=$((now - HISTORY_WINDOW_SEC))
+	awk -v c="$cut" '$1 >= c' "$hist" > "$hist.$$" 2>/dev/null \
+		&& mv "$hist.$$" "$hist" 2>/dev/null
+	rm -f "$hist.$$"
+}
+
+# Without an hour of span and a real drop the slope is noise, and a
+# near-flat history produces estimates in the thousands of days.
+drain_eta_hours() {
+	local slot="$1" value="$2"
+	local hist="$STATE_DIR/$slot.history"
+	[ -s "$hist" ] || return 0
+	local t0 v0 t1 v1 span
+	read -r t0 v0 < <(head -n 1 "$hist")
+	read -r t1 v1 < <(tail -n 1 "$hist")
+	span=$((t1 - t0))
+	[ "$span" -ge 3600 ] || return 0
+	[ $((v0 - v1)) -ge 2 ] || return 0
+	awk -v a="$v0" -v b="$v1" -v s="$span" -v v="$value" 'BEGIN {
+		r = (a - b) / s
+		if (r <= 0) exit 0
+		h = v / r / 3600
+		if (h > 720) exit 0
+		printf "%.0f", h
+	}'
+}
+
+# Two short lines: a click-hint line three times wider than the rest left
+# the tooltip mostly empty space. Returned raw; jq escapes it when the
+# output line is built.
+tooltip_text() {
+	local error="$1" found="$2" name="$3" type="$4" lastseen="$5" batteries_line="$6" warning="${7:-}"
+	if [ -n "$error" ]; then
+		printf 'ZMK: %s' "$error"
+		return 0
+	fi
+	if [ "$found" != "true" ]; then
+		if [ -n "$warning" ]; then
+			printf '%s' "$warning"
+		else
+			printf 'No ZMK keyboard found · pair it over Bluetooth'
+		fi
+		return 0
+	fi
+	local link
+	case "$type" in
+		bluetooth) link="Bluetooth" ;;
+		wired) link="Wired" ;;
+		*) link="Not connected${lastseen:+ · last seen $lastseen}" ;;
+	esac
+	local line1="${name:-ZMK keyboard} · $link"
+	if [ -n "$batteries_line" ]; then
+		printf '%s\n%s' "$line1" "$batteries_line"
+	else
+		printf '%s' "$line1"
+	fi
+}
+
+main() {
+	local pinned="$ZMK_MAC"
+	local error=""
+	mkdir -p "$STATE_ROOT"
+
+	# Every fact the script reports depends on one of these three, so a
+	# missing one is reported instead of guessed at.
+	local tool
+	for tool in jq busctl timeout; do
+		if ! command -v "$tool" >/dev/null 2>&1; then
+			error="$tool missing"
+			break
+		fi
+	done
+	if [ "$error" = "jq missing" ]; then
+		# jq builds the rest of this line, so without it only a constant
+		# literal can be printed.
+		printf '%s\n' '{"text":"󰌌","tooltip":"ZMK: jq missing","class":"normal","found":false,"connected":false,"ble":false,"cable":false,"hid":false,"type":"none","name":"","batteries":[],"address":"","path":"","paired":false,"bonded":false,"trusted":false,"wake":false,"devid":"","usbSerial":"","lastseen":"","error":"jq missing","warning":""}'
+		return 0
+	fi
+
+	local objects
+	if [ -n "$error" ]; then
+		objects='{"data":[{}]}'
+	elif ! objects=$(load_objects) || [ -z "$objects" ]; then
+		error="BlueZ unreachable"
+		objects='{"data":[{}]}'
+	fi
+	local row
+	if ! row=$(select_device "$objects" "$ZMK_MAC") && [ -z "$error" ]; then
+		error="BlueZ reply unreadable"
+	fi
+	if [ -n "$pinned" ] && [ -z "$row" ]; then
+		warning="no paired board at $pinned"
+	fi
+	local address="" name="" connected_flag=false paired=false bonded=false trusted=false wake=false
+	ZMK_PATH=""
+	if [ -n "$row" ]; then
+		IFS=$'\x1f' read -r ZMK_PATH address name connected_flag paired bonded trusted wake <<<"$row"
+	fi
+	# BlueZ only ever reports XX:XX:XX:XX:XX:XX on a /org/bluez/hciN path,
+	# and the address becomes a directory name, so anything else is treated
+	# as no device.
+	if { [ -n "$address" ] && ! [[ $address =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]]; } \
+		|| { [ -n "$ZMK_PATH" ] && ! [[ $ZMK_PATH =~ ^/org/bluez/hci[0-9]+/dev_[0-9A-F_]{17}$ ]]; }; then
+		ZMK_PATH=""; address=""; name=""; connected_flag=false
+	fi
+	ZMK_MAC="$address"
+	STATE_DIR="$STATE_ROOT/${ZMK_MAC//:/_}"
+	[ -n "$ZMK_MAC" ] && mkdir -p "$STATE_DIR"
+
+	local ble_connected=no
+	[ "$connected_flag" = "true" ] && ble_connected=yes
+
+	# A cabled peripheral enumerates on USB without HID, so USB presence
+	# means power only. HID bound means a cabled central, and a wired path.
+	local usb_dir="" d
+	for d in "$USB_DEVICES_DIR"/*; do
+		if [ -r "$d/idVendor" ] \
+			&& [ "$(cat "$d/idVendor" 2>/dev/null)" = "${usb_id_lower%%:*}" ] \
+			&& [ "$(cat "$d/idProduct" 2>/dev/null)" = "${usb_id_lower##*:}" ]; then
+			usb_dir="$d"
+			break
+		fi
+	done
+	[ -n "$usb_dir" ] && cable_present=true
+	compgen -G "$HID_DEVICES_DIR/0003:${usb_id_upper}.*" > /dev/null && hid_present=true
+
+	# A board only ever used over the cable has no pairing to find, but it
+	# is right there on USB.
+	local found=false
+	{ [ -n "$ZMK_PATH" ] || [ "$cable_present" = "true" ]; } && found=true
+
+	local usb_ts=0 ble_ts=0
+	if [ "$hid_present" = "true" ] && [ "$ble_connected" = "yes" ]; then
+		sample_input_paths "$(input_node_for_bus 0003)" "$(input_node_for_bus 0005)"
+		usb_ts=$(cat "$STATE_DIR/inpath.usb" 2>/dev/null || echo 0)
+		ble_ts=$(cat "$STATE_DIR/inpath.ble" 2>/dev/null || echo 0)
+	fi
+	local type; type=$(decide_type "$hid_present" "$ble_connected" "$usb_ts" "$ble_ts")
+	local connected=false
+	[ "$type" != "none" ] && connected=true
+
+	# The PnP id changes only with a firmware flash, so it is cached for
+	# the session and survives the board sleeping. BlueZ's cached bytes
+	# save a read when it has them.
+	local devid=""
+	if [ -n "$ZMK_MAC" ] && [ -s "$STATE_DIR/devid" ]; then
+		devid=$(cat "$STATE_DIR/devid")
+	elif [ "$ble_connected" = "yes" ]; then
+		local pnp_path bytes
+		IFS=$'\x1f' read -r pnp_path bytes <<<"$(pnp_char "$objects" "$ZMK_PATH")"
+		if [ -n "$pnp_path" ] && [ -z "$bytes" ]; then
+			bytes=$(read_byte_array "$pnp_path" org.bluez.GattCharacteristic1)
+		fi
+		if [ "$(awk '{print NF}' <<<"$bytes")" -ge 7 ]; then
+			# Byte 0 says which registry the vendor id comes from, then VID,
+			# PID, and version each ride as a little-endian pair, hence seven
+			# bytes total and the discarded first field.
+			local _ vid_lo vid_hi pid_lo pid_hi ver_lo ver_hi vid pid ver
+			read -r _ vid_lo vid_hi pid_lo pid_hi ver_lo ver_hi <<<"$bytes"
+			vid=$(printf '%04X' "$((vid_hi * 256 + vid_lo))")
+			pid=$(printf '%04X' "$((pid_hi * 256 + pid_lo))")
+			ver=$((ver_hi * 256 + ver_lo))
+			devid="$vid:$pid v$((ver >> 8)).$((ver & 0xFF))"
+			printf '%s\n' "$devid" > "$STATE_DIR/devid.tmp.$$" && mv -f "$STATE_DIR/devid.tmp.$$" "$STATE_DIR/devid"
+		fi
+	fi
+
+	# bcdDevice is the release number the firmware burns in, the closest
+	# thing to a version over USB.
+	local usb_serial=""
+	if [ "$type" = "wired" ] && [ -n "$usb_dir" ]; then
+		local usb_vid usb_pid bcd ver
+		usb_vid=$(tr 'a-f' 'A-F' < "$usb_dir/idVendor" 2>/dev/null)
+		usb_pid=$(tr 'a-f' 'A-F' < "$usb_dir/idProduct" 2>/dev/null)
+		bcd=$(tr -d '[:space:]' < "$usb_dir/bcdDevice" 2>/dev/null)
+		ver=$(usb_version_suffix "$bcd")
+		devid="${usb_vid:-${usb_id_upper%%:*}}:${usb_pid:-${usb_id_upper##*:}}$ver"
+		usb_serial=$(tr -d '[:cntrl:]' < "$usb_dir/serial" 2>/dev/null)
+	fi
+
+	# The host can't tell a board that fell asleep from one that was
+	# switched off, so link-down is just "not connected", with last-seen.
+	local lastseen=""
+	if [ "$ble_connected" = "yes" ]; then
+		date +%s > "$STATE_DIR/lastseen.tmp.$$" && mv -f "$STATE_DIR/lastseen.tmp.$$" "$STATE_DIR/lastseen"
+	elif [ -n "$ZMK_MAC" ] && [ -s "$STATE_DIR/lastseen" ]; then
+		lastseen=$(humanize_delta $(( $(date +%s) - $(cat "$STATE_DIR/lastseen") )))
+	fi
+
+	local -a batteries_json=() summary=() battery_line_parts=()
+	local urgent=0
+	if [ "$ble_connected" = "yes" ]; then
+		local -a rows=()
+		mapfile -t rows < <(battery_chars "$objects" "$ZMK_PATH")
+		local count=${#rows[@]} peripherals=$((count > 1 ? count - 1 : 0))
+		local i char slot raw desc_path label name_long role value charging eta_hours eta bar_readout tooltip_readout
+		for i in "${!rows[@]}"; do
+			IFS=$'\x1f' read -r char raw desc_path <<<"${rows[$i]}"
+			slot="bat$((i + 1))"
+			# One live read fills BlueZ's cache; the label file covers a torn
+			# reply on a later poll.
+			if [ -z "$raw" ] && [ -n "$desc_path" ]; then
+				raw=$(read_bytes_as_text "$desc_path" org.bluez.GattDescriptor1)
+			fi
+			# Control bytes and angle brackets are stripped because they would
+			# end the row or render as rich text in the shell's Text items.
+			# Quotes and backslashes are left alone because jq escapes them.
+			raw=$(tr -d '\000-\037<>' <<<"$raw")
+			if [ -n "$raw" ]; then
+				printf '%s\n' "$raw" > "$STATE_DIR/$slot.label.tmp.$$" && mv -f "$STATE_DIR/$slot.label.tmp.$$" "$STATE_DIR/$slot.label"
+			elif [ -s "$STATE_DIR/$slot.label" ]; then
+				raw=$(tr -d '\000-\037<>' < "$STATE_DIR/$slot.label")
+			fi
+			role="central"
+			case "$raw" in Peripheral*) role="peripheral" ;; esac
+			IFS='|' read -r label name_long <<<"$(battery_label "$raw" "$count")"
+
+			value=$(read_battery_level "$char")
+			# A torn busctl reply must never render as a bogus percentage.
+			case "$value" in ""|*[!0-9]*) value="" ;; esac
+			[ -n "$value" ] && [ "$value" -gt 100 ] && value=""
+			charging=false
+			eta=""
+			if [ -n "$value" ]; then
+				# ZMK pins the charging piece's percentage, so the number would
+				# mislead wherever it showed.
+				charging=$(charging_role "$role" "$peripherals")
+				if [ "$charging" = "true" ]; then
+					bar_readout="chg"
+					tooltip_readout="charging"
+				else
+					bar_readout="$value"
+					tooltip_readout="${value}%"
+					[ "$value" -le "$LOW_THRESHOLD" ] && urgent=1
+					low_notify "$slot" "${name_long:-${name:-Keyboard}}" "$value"
+				fi
+				record_history "$slot" "$value"
+				eta_hours=$(drain_eta_hours "$slot" "$value")
+				[ -n "$eta_hours" ] && eta=$(humanize_hours "$eta_hours")
+			else
+				bar_readout="?"
+				tooltip_readout="?"
+			fi
+			summary+=("${label:+$label:}$bar_readout")
+			battery_line_parts+=("${name_long:+$name_long }$tooltip_readout")
+			batteries_json+=("$(jq -cn --arg label "$label" --arg name "$name_long" --arg eta "$eta" --argjson value "${value:-null}" --argjson charging "$charging" '{label: $label, name: $name, value: $value, eta: $eta, charging: $charging}')")
+		done
+	fi
+
+	local text tooltip
+	local batteries='[]'
+	[ "${#batteries_json[@]}" -gt 0 ] && batteries=$(printf '%s\n' "${batteries_json[@]}" | jq -cs '.')
+	local summary_text; summary_text=$(IFS=' '; echo "${summary[*]}")
+	local batteries_line="" part
+	for part in "${battery_line_parts[@]}"; do
+		batteries_line="${batteries_line:+$batteries_line · }$part"
+	done
+	tooltip=$(tooltip_text "$error" "$found" "$name" "$type" "$lastseen" "$batteries_line" "$warning")
+	if [ "$found" = "true" ]; then
+		text="󰌌${summary_text:+ $summary_text}"
+	else
+		text="󰌌"
+	fi
+
+	jq -cn \
+		--arg text "$text" --arg tooltip "$tooltip" --arg class "$([ "$urgent" = 1 ] && echo urgent || echo normal)" \
+		--argjson found "$found" --argjson connected "$connected" \
+		--argjson ble "$([ "$ble_connected" = "yes" ] && echo true || echo false)" \
+		--argjson cable "$cable_present" --argjson hid "$hid_present" \
+		--arg type "$type" --arg name "${name:-}" --argjson batteries "$batteries" \
+		--arg address "$ZMK_MAC" --arg path "$ZMK_PATH" \
+		--argjson paired "$paired" --argjson bonded "$bonded" --argjson trusted "$trusted" --argjson wake "$wake" \
+		--arg devid "$devid" --arg usbSerial "$usb_serial" --arg lastseen "$lastseen" \
+		--arg error "$error" --arg warning "$warning" \
+		'{text: $text, tooltip: $tooltip, class: $class, found: $found, connected: $connected, ble: $ble, cable: $cable, hid: $hid, type: $type, name: $name, batteries: $batteries, address: $address, path: $path, paired: $paired, bonded: $bonded, trusted: $trusted, wake: $wake, devid: $devid, usbSerial: $usbSerial, lastseen: $lastseen, error: $error, warning: $warning}'
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+	main "$@"
+fi
