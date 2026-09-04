@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ashmortar.zmk",
   "name": "ZMK keyboard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "ashmortar",
   "license": "MIT",
   "description": "ZMK keyboard status for the Omarchy bar: Bluetooth or USB transmission path, per-piece battery over BLE GATT, charging, and a detail popup",

@@ -13,11 +13,14 @@
 # board wins over a paired one. Sourcing this file defines the functions
 # without running anything, which is how the tests use it.
 
-# The shell's PATH can carry user shims (version managers, wrappers). Only
-# system binaries run here. Tests point this at a directory of stubs.
-PATH="${ZMK_STATUS_PATH:-/usr/local/bin:/usr/bin:/bin}"
+# Nothing in this script reads the environment. The shell's PATH can carry
+# user shims, and an inherited override of any path here would let
+# whatever set the widget's environment swap in a binary or redirect
+# state. The tests source this file and reassign these variables before
+# calling main.
+PATH="/usr/bin:/bin"
 export PATH
-NOTIFY_CMD="${ZMK_NOTIFY_CMD:-${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-notification-send}"
+NOTIFY_CMD="/usr/bin/omarchy-notification-send"
 
 ZMK_MAC="${1:-}"
 USB_HID_ID="${2:-1D50:615E}"
@@ -29,20 +32,64 @@ PNP_ID_UUID="00002a50-0000-1000-8000-00805f9b34fb"
 # 48 hours: long enough for a slope, short enough that a change of habit
 # shows within a couple of days.
 HISTORY_WINDOW_SEC=172800
-STATE_ROOT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-zmk"
-INPUT_DEVICES_FILE="${INPUT_DEVICES_FILE:-/proc/bus/input/devices}"
-USB_DEVICES_DIR="${USB_DEVICES_DIR:-/sys/bus/usb/devices}"
-HID_DEVICES_DIR="${HID_DEVICES_DIR:-/sys/bus/hid/devices}"
+# systemd's per-user runtime directory, named directly rather than through
+# $XDG_RUNTIME_DIR so the environment cannot point state elsewhere.
+RUNTIME_DIR="/run/user/$UID"
+STATE_ROOT="$RUNTIME_DIR/omarchy-zmk"
+BLUEZ_OBJECTS_FILE=""
+INPUT_DEVICES_FILE="/proc/bus/input/devices"
+USB_DEVICES_DIR="/sys/bus/usb/devices"
+HID_DEVICES_DIR="/sys/bus/hid/devices"
 # sysfs names HID devices in uppercase hex and USB devices in lowercase.
 usb_id_upper=${USB_HID_ID^^}
 usb_id_lower=${USB_HID_ID,,}
 STATE_DIR=""
 cable_present=false
 hid_present=false
-# Set by the pinned-MAC check in main and by sample_input_paths when
-# python3 is missing. main never redeclares it as local, so those
-# assignments stick.
+# Set by the pinned-MAC and state-dir checks in main and by
+# sample_input_paths when python3 is missing. main never redeclares it as
+# local, so those assignments stick.
 warning=""
+
+# The runtime directory is private to this user, but every process the
+# user runs shares it, so a planted symlink or a loosened mode there must
+# not redirect state. Anything but a real directory we own with mode 700
+# disables state for the run rather than being used.
+private_dir() {
+	[ ! -L "$1" ] && [ -d "$1" ] && [ -O "$1" ] && [ "$(stat -c %a -- "$1" 2>/dev/null)" = "700" ]
+}
+
+# A directory of ours left at the default mode by an earlier release is
+# tightened rather than refused; anything not ours, or not a directory,
+# never gets that far.
+ensure_private_dir() {
+	[ -e "$1" ] || [ -L "$1" ] || mkdir -m 700 -- "$1" 2>/dev/null
+	if [ ! -L "$1" ] && [ -d "$1" ] && [ -O "$1" ]; then chmod 700 -- "$1" 2>/dev/null; fi
+	private_dir "$1"
+}
+
+# State is only ever a regular file we own, reached without following a
+# symlink: a link planted in the state dir must not turn a cache read into
+# a read of some other file, or a flag check into a lie.
+has_state() {
+	[ -n "$STATE_DIR" ] && [ ! -L "$1" ] && [ -f "$1" ] && [ -O "$1" ]
+}
+
+read_state() {
+	has_state "$1" && cat -- "$1" 2>/dev/null
+}
+
+# Content arrives on stdin, lands in a fresh mktemp name, and is renamed
+# into place: rename replaces a planted symlink instead of writing through
+# it, and a poll killed mid-write leaves the previous file whole.
+write_state() {
+	local file="$1" tmp
+	[ -n "$STATE_DIR" ] || { cat >/dev/null; return 1; }
+	tmp=$(mktemp -- "$STATE_DIR/.tmp.XXXXXX") || { cat >/dev/null; return 1; }
+	if cat > "$tmp" && mv -f -T -- "$tmp" "$file" 2>/dev/null; then return 0; fi
+	rm -f -- "$tmp"
+	return 1
+}
 
 # The host cannot see which side is central, so labels name roles, not
 # sides. A lone peripheral needs no index; several keep ZMK's numbering.
@@ -104,13 +151,13 @@ usb_version_suffix() {
 }
 
 # One ObjectManager call carries every device, characteristic, descriptor,
-# and cached value, where per-property calls cost a process each. The env
-# override is how the tests feed a fixture instead of the live bus.
+# and cached value, where per-property calls cost a process each. The tests
+# point BLUEZ_OBJECTS_FILE at a fixture instead of the live bus.
 # A process that ignores TERM would otherwise outlive its deadline, hence
 # -k on every timeout in this script. A hostile or enormous object tree
 # must not turn into unbounded parsing, hence the cap on both branches.
 load_objects() {
-	if [ -n "${BLUEZ_OBJECTS_FILE:-}" ]; then
+	if [ -n "$BLUEZ_OBJECTS_FILE" ]; then
 		cat "$BLUEZ_OBJECTS_FILE" 2>/dev/null
 	else
 		timeout -k 2 3 busctl call --json=short org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null
@@ -195,8 +242,7 @@ sample_window_sec() {
 # state dir passed as the reader's first argument is unique to this
 # reader, so matching it in the cmdline is the reliable check.
 reader_alive() {
-	local pidfile="$1"
-	local pid; pid=$(cat "$pidfile" 2>/dev/null)
+	local pid; pid=$(read_state "$STATE_DIR/inpath.pid")
 	[[ $pid =~ ^[0-9]+$ ]] && grep -q -a -F -- "$STATE_DIR" "/proc/$pid/cmdline" 2>/dev/null
 }
 
@@ -211,11 +257,17 @@ sample_input_paths() {
 	[ -n "$1" ] && [ -r "$1" ] && args+=("usb=$1")
 	[ -n "$2" ] && [ -r "$2" ] && args+=("ble=$2")
 	[ "${#args[@]}" -gt 0 ] || return 0
-	local pidfile="$STATE_DIR/inpath.pid"
-	reader_alive "$pidfile" && return 0
+	[ -n "$STATE_DIR" ] || return 0
+	reader_alive && return 0
 	(
 		timeout -k 2 "$(sample_window_sec "$REFRESH_SEC")" python3 - "$STATE_DIR" "${args[@]}" <<-'PY'
-		import os, select, struct, sys, time
+		import os, select, stat, struct, sys, tempfile, time
+		stamp_dir = sys.argv[1]
+		# Same rule as the shell side: the stamps go nowhere but a private
+		# directory of ours, and the check is on the link, not its target.
+		st = os.lstat(stamp_dir)
+		if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
+		    sys.exit(1)
 		nodes = {}
 		for arg in sys.argv[2:]:
 		    path, node = arg.split("=", 1)
@@ -225,7 +277,6 @@ sample_input_paths() {
 		        pass
 		if not nodes:
 		    sys.exit(1)
-		stamp_dir = sys.argv[1]
 		last = {}
 		# 24 bytes and "llHHi" are struct input_event on 64-bit Linux: two
 		# longs (seconds, microseconds) then two unsigned shorts and an int.
@@ -250,15 +301,17 @@ sample_input_paths() {
 		            if now - last.get(path, 0) < 0.5:
 		                break
 		            last[path] = now
-		            tmp = os.path.join(stamp_dir, "inpath." + path + ".tmp")
-		            with open(tmp, "w") as f:
+		            # mkstemp opens exclusively and never through a symlink;
+		            # the rename then replaces whatever sits at the stamp name.
+		            fd_tmp, tmp = tempfile.mkstemp(prefix=".tmp.", dir=stamp_dir)
+		            with os.fdopen(fd_tmp, "w") as f:
 		                f.write(str(int(now * 1000)))
 		            os.replace(tmp, os.path.join(stamp_dir, "inpath." + path))
 		            # One stamp per chunk per path, for the same reason.
 		            break
 		PY
 	) </dev/null >/dev/null 2>&1 &
-	printf '%s\n' "$!" > "$pidfile"
+	printf '%s\n' "$!" | write_state "$STATE_DIR/inpath.pid"
 }
 
 # busctl prints "ay <len>" before the bytes, hence dropping the first two
@@ -292,16 +345,19 @@ read_battery_level() {
 
 # Bounded so a hung notification daemon can't block a poll, and the flag
 # is only set once the send actually succeeds, so a missing daemon never
-# consumes the crossing.
+# consumes the crossing. Without a state dir there is no flag to stop a
+# notification per poll, so none is sent.
 low_notify() {
 	local slot="$1" subject="$2" value="$3"
+	local flag="$STATE_DIR/$slot.notified"
+	[ -n "$STATE_DIR" ] || return 0
 	if [ "$value" -le "$LOW_THRESHOLD" ]; then
-		if [ ! -e "$STATE_DIR/$slot.notified" ]; then
+		if ! has_state "$flag"; then
 			timeout -k 1 3 "$NOTIFY_CMD" "ZMK: ${subject} battery at ${value}%, charge soon" 2>/dev/null \
-				&& touch "$STATE_DIR/$slot.notified"
+				&& : | write_state "$flag"
 		fi
 	elif [ "$value" -ge $((LOW_THRESHOLD + 5)) ]; then
-		rm -f "$STATE_DIR/$slot.notified"
+		rm -f -- "$flag"
 	fi
 }
 
@@ -313,24 +369,25 @@ low_notify() {
 record_history() {
 	local slot="$1" value="$2"
 	local hist="$STATE_DIR/$slot.history"
-	# A kill between the write and the rename can leave one of these
-	# behind. Only files older than a minute are swept, and only the
-	# numeric-suffixed temp files, never the history itself: two bar
-	# instances poll the same directory, so a fresh one could belong to a
-	# sibling still between its own awk and mv.
-	find "$STATE_DIR" -maxdepth 1 -name "$slot.history.[0-9]*" -mmin +1 -delete 2>/dev/null
+	[ -n "$STATE_DIR" ] || return 0
+	# A kill between mktemp and the rename leaves a temp file behind. Only
+	# ones older than a minute are swept: two bar instances poll the same
+	# directory, so a fresh one could belong to a sibling mid-write.
+	find "$STATE_DIR" -maxdepth 1 -type f -name '.tmp.*' -mmin +1 -delete 2>/dev/null
 	local now; now=$(date +%s)
 	local lastts lastval
-	read -r lastts lastval < <(tail -n 1 "$hist" 2>/dev/null)
+	read -r lastts lastval < <(read_state "$hist" | tail -n 1)
+	# A torn or tampered row must not reach the arithmetic below.
+	[[ $lastts =~ ^[0-9]+$ && $lastval =~ ^[0-9]+$ ]] || { lastts=""; lastval=""; }
 	if [ -n "$lastval" ] && [ "$value" -gt "$((lastval + 1))" ]; then
 		# A rise means a charge happened, so the old slope is meaningless.
-		: > "$hist"
+		rm -f -- "$hist"
 		lastts=""
 		lastval=""
 	fi
 	if [ "$cable_present" = "true" ]; then
 		if [ -z "$lastts" ] || [ $((now - lastts)) -gt 21600 ]; then
-			: > "$hist"
+			rm -f -- "$hist"
 		fi
 		return 0
 	fi
@@ -340,22 +397,22 @@ record_history() {
 	if [ -n "$lastts" ] && [ "$lastval" = "$value" ] && [ $((now - lastts)) -lt 300 ]; then
 		return 0
 	fi
-	printf '%s %s\n' "$now" "$value" >> "$hist"
 	local cut=$((now - HISTORY_WINDOW_SEC))
-	awk -v c="$cut" '$1 >= c' "$hist" > "$hist.$$" 2>/dev/null \
-		&& mv "$hist.$$" "$hist" 2>/dev/null
-	rm -f "$hist.$$"
+	{ read_state "$hist"; printf '%s %s\n' "$now" "$value"; } \
+		| awk -v c="$cut" '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $1 >= c' \
+		| write_state "$hist"
 }
 
 # Without an hour of span and a real drop the slope is noise, and a
 # near-flat history produces estimates in the thousands of days.
 drain_eta_hours() {
 	local slot="$1" value="$2"
-	local hist="$STATE_DIR/$slot.history"
-	[ -s "$hist" ] || return 0
+	local rows; rows=$(read_state "$STATE_DIR/$slot.history")
+	[ -n "$rows" ] || return 0
 	local t0 v0 t1 v1 span
-	read -r t0 v0 < <(head -n 1 "$hist")
-	read -r t1 v1 < <(tail -n 1 "$hist")
+	read -r t0 v0 < <(head -n 1 <<<"$rows")
+	read -r t1 v1 < <(tail -n 1 <<<"$rows")
+	[[ $t0 =~ ^[0-9]+$ && $v0 =~ ^[0-9]+$ && $t1 =~ ^[0-9]+$ && $v1 =~ ^[0-9]+$ ]] || return 0
 	span=$((t1 - t0))
 	[ "$span" -ge 3600 ] || return 0
 	[ $((v0 - v1)) -ge 2 ] || return 0
@@ -402,7 +459,6 @@ tooltip_text() {
 main() {
 	local pinned="$ZMK_MAC"
 	local error=""
-	mkdir -p "$STATE_ROOT"
 
 	# Every fact the script reports depends on one of these three, so a
 	# missing one is reported instead of guessed at.
@@ -447,8 +503,14 @@ main() {
 		ZMK_PATH=""; address=""; name=""; connected_flag=false
 	fi
 	ZMK_MAC="$address"
-	STATE_DIR="$STATE_ROOT/${ZMK_MAC//:/_}"
-	[ -n "$ZMK_MAC" ] && mkdir -p "$STATE_DIR"
+	STATE_DIR=""
+	if [ -n "$ZMK_MAC" ]; then
+		if private_dir "$RUNTIME_DIR" && ensure_private_dir "$STATE_ROOT" && ensure_private_dir "$STATE_ROOT/${ZMK_MAC//:/_}"; then
+			STATE_DIR="$STATE_ROOT/${ZMK_MAC//:/_}"
+		else
+			warning="runtime dir not private, state disabled"
+		fi
+	fi
 
 	local ble_connected=no
 	[ "$connected_flag" = "true" ] && ble_connected=yes
@@ -475,8 +537,10 @@ main() {
 	local usb_ts=0 ble_ts=0
 	if [ "$hid_present" = "true" ] && [ "$ble_connected" = "yes" ]; then
 		sample_input_paths "$(input_node_for_bus 0003)" "$(input_node_for_bus 0005)"
-		usb_ts=$(cat "$STATE_DIR/inpath.usb" 2>/dev/null || echo 0)
-		ble_ts=$(cat "$STATE_DIR/inpath.ble" 2>/dev/null || echo 0)
+		usb_ts=$(read_state "$STATE_DIR/inpath.usb")
+		ble_ts=$(read_state "$STATE_DIR/inpath.ble")
+		[[ $usb_ts =~ ^[0-9]+$ ]] || usb_ts=0
+		[[ $ble_ts =~ ^[0-9]+$ ]] || ble_ts=0
 	fi
 	local type; type=$(decide_type "$hid_present" "$ble_connected" "$usb_ts" "$ble_ts")
 	local connected=false
@@ -485,10 +549,11 @@ main() {
 	# The PnP id changes only with a firmware flash, so it is cached for
 	# the session and survives the board sleeping. BlueZ's cached bytes
 	# save a read when it has them.
-	local devid=""
-	if [ -n "$ZMK_MAC" ] && [ -s "$STATE_DIR/devid" ]; then
-		devid=$(cat "$STATE_DIR/devid")
-	elif [ "$ble_connected" = "yes" ]; then
+	local devid; devid=$(read_state "$STATE_DIR/devid")
+	# The cache holds exactly the shape built below; anything else was not
+	# written by this script and is rebuilt.
+	[[ $devid =~ ^[0-9A-F]{4}:[0-9A-F]{4}\ v[0-9]+\.[0-9]+$ ]] || devid=""
+	if [ -z "$devid" ] && [ "$ble_connected" = "yes" ]; then
 		local pnp_path bytes
 		IFS=$'\x1f' read -r pnp_path bytes <<<"$(pnp_char "$objects" "$ZMK_PATH")"
 		if [ -n "$pnp_path" ] && [ -z "$bytes" ]; then
@@ -504,7 +569,7 @@ main() {
 			pid=$(printf '%04X' "$((pid_hi * 256 + pid_lo))")
 			ver=$((ver_hi * 256 + ver_lo))
 			devid="$vid:$pid v$((ver >> 8)).$((ver & 0xFF))"
-			printf '%s\n' "$devid" > "$STATE_DIR/devid.tmp.$$" && mv -f "$STATE_DIR/devid.tmp.$$" "$STATE_DIR/devid"
+			printf '%s\n' "$devid" | write_state "$STATE_DIR/devid"
 		fi
 	fi
 
@@ -525,9 +590,10 @@ main() {
 	# switched off, so link-down is just "not connected", with last-seen.
 	local lastseen=""
 	if [ "$ble_connected" = "yes" ]; then
-		date +%s > "$STATE_DIR/lastseen.tmp.$$" && mv -f "$STATE_DIR/lastseen.tmp.$$" "$STATE_DIR/lastseen"
-	elif [ -n "$ZMK_MAC" ] && [ -s "$STATE_DIR/lastseen" ]; then
-		lastseen=$(humanize_delta $(( $(date +%s) - $(cat "$STATE_DIR/lastseen") )))
+		date +%s | write_state "$STATE_DIR/lastseen"
+	else
+		local seen; seen=$(read_state "$STATE_DIR/lastseen")
+		[[ $seen =~ ^[0-9]+$ ]] && lastseen=$(humanize_delta $(( $(date +%s) - seen )))
 	fi
 
 	local -a batteries_json=() summary=() battery_line_parts=()
@@ -550,9 +616,9 @@ main() {
 			# Quotes and backslashes are left alone because jq escapes them.
 			raw=$(tr -d '\000-\037<>' <<<"$raw")
 			if [ -n "$raw" ]; then
-				printf '%s\n' "$raw" > "$STATE_DIR/$slot.label.tmp.$$" && mv -f "$STATE_DIR/$slot.label.tmp.$$" "$STATE_DIR/$slot.label"
-			elif [ -s "$STATE_DIR/$slot.label" ]; then
-				raw=$(tr -d '\000-\037<>' < "$STATE_DIR/$slot.label")
+				printf '%s\n' "$raw" | write_state "$STATE_DIR/$slot.label"
+			else
+				raw=$(read_state "$STATE_DIR/$slot.label" | head -n 1 | tr -d '\000-\037<>' | head -c 64)
 			fi
 			role="central"
 			case "$raw" in Peripheral*) role="peripheral" ;; esac

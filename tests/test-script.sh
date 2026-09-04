@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Unit tests for the script's functions plus end-to-end runs against the
 # BlueZ fixture and a busctl stub. Sourcing the script defines its
-# functions without running main; everything that touches the system is
-# redirected into a temp dir via the variables set below.
+# functions without running main. The script reads nothing from the
+# environment, so everything that touches the system is redirected into a
+# temp dir by reassigning its variables after sourcing.
 set -u
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 tmp=$(mktemp -d)
@@ -12,12 +13,13 @@ assert_eq() {
 	if [ "$2" = "$3" ]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s: expected [%s] got [%s]\n' "$1" "$3" "$2"; fails=$((fails + 1)); fi
 }
 
-export XDG_RUNTIME_DIR="$tmp"
-export INPUT_DEVICES_FILE="$tmp/devices"
 # shellcheck source=../script/zmk-status
 source "$here/../script/zmk-status" "" "1d50:615e" 15 10
-STATE_DIR="$tmp/omarchy-zmk/E2_D9"
-mkdir -p "$STATE_DIR"
+RUNTIME_DIR="$tmp"
+STATE_ROOT="$tmp/omarchy-zmk"
+INPUT_DEVICES_FILE="$tmp/devices"
+STATE_DIR="$STATE_ROOT/E2_D9"
+(umask 077; mkdir -p "$STATE_DIR")
 
 # A real stub file, not a shell function: low_notify now runs NOTIFY_CMD
 # under timeout, which execs a named program and never sees shell functions.
@@ -150,7 +152,7 @@ record_history bat6 80
 assert_eq "record_history cable 1h old kept" "$(wc -l < "$STATE_DIR/bat6.history")" "2"
 printf '%s 90\n%s 80\n' $((now - 36000)) $((now - 25200)) > "$STATE_DIR/bat7.history"
 record_history bat7 80
-assert_eq "record_history cable 7h old truncated" "$(wc -l < "$STATE_DIR/bat7.history")" "0"
+assert_eq "record_history cable 7h old removed" "$([ -e "$STATE_DIR/bat7.history" ] && echo yes || echo no)" "no"
 cable_present=false
 
 fixture="$here/fixtures/bluez-objects.json"
@@ -196,37 +198,62 @@ assert_eq "usb_version_suffix valid bcd" "$(usb_version_suffix 0305)" " v3.5"
 assert_eq "usb_version_suffix invalid bcd" "$(usb_version_suffix zz)" ""
 
 pidtest_dir="$tmp/pidfile-test"
-mkdir -p "$pidtest_dir"
-printf -- '-1\n' > "$pidtest_dir/inpath.pid"
-STATE_DIR="$pidtest_dir" sample_input_paths "" ""
-assert_eq "sample_input_paths no nodes leaves pidfile" "$(cat "$pidtest_dir/inpath.pid")" "-1"
-assert_eq "reader_alive rejects -1" "$(reader_alive "$pidtest_dir/inpath.pid" && echo yes || echo no)" "no"
-printf '%s' "$$" > "$pidtest_dir/inpath.pid"
-assert_eq "reader_alive rejects a live non-reader pid" "$(reader_alive "$pidtest_dir/inpath.pid" && echo yes || echo no)" "no"
-rm -f "$pidtest_dir/missing.pid"
-assert_eq "reader_alive rejects a missing pidfile" "$(reader_alive "$pidtest_dir/missing.pid" && echo yes || echo no)" "no"
+(umask 077; mkdir -p "$pidtest_dir")
+STATE_DIR="$pidtest_dir"
+printf -- '-1\n' > "$STATE_DIR/inpath.pid"
+sample_input_paths "" ""
+assert_eq "sample_input_paths no nodes leaves pidfile" "$(cat "$STATE_DIR/inpath.pid")" "-1"
+assert_eq "reader_alive rejects -1" "$(reader_alive && echo yes || echo no)" "no"
+printf '%s' "$$" > "$STATE_DIR/inpath.pid"
+assert_eq "reader_alive rejects a live non-reader pid" "$(reader_alive && echo yes || echo no)" "no"
+rm -f "$STATE_DIR/inpath.pid"
+assert_eq "reader_alive rejects a missing pidfile" "$(reader_alive && echo yes || echo no)" "no"
+
+# State helpers: a symlink at a state name is neither read through nor
+# written through, and a write lands as a regular file in its place.
+printf '123\n' > "$tmp/link-target"
+ln -s "$tmp/link-target" "$STATE_DIR/planted"
+assert_eq "read_state refuses a symlink" "$(read_state "$STATE_DIR/planted")" ""
+assert_eq "has_state refuses a symlink" "$(has_state "$STATE_DIR/planted" && echo yes || echo no)" "no"
+printf 'new\n' | write_state "$STATE_DIR/planted"
+assert_eq "write_state leaves the symlink target alone" "$(cat "$tmp/link-target")" "123"
+assert_eq "write_state replaces the symlink with a file" "$([ -f "$STATE_DIR/planted" ] && [ ! -L "$STATE_DIR/planted" ] && echo yes || echo no)" "yes"
+assert_eq "write_state content readable" "$(read_state "$STATE_DIR/planted")" "new"
+assert_eq "write_state leaves no temp file" "$(find "$STATE_DIR" -name '.tmp.*' | wc -l)" "0"
+STATE_DIR=""
+assert_eq "read_state without a state dir" "$(read_state "$tmp/link-target")" ""
+assert_eq "write_state without a state dir fails" "$(printf x | write_state "$tmp/nowhere" && echo yes || echo no)" "no"
+assert_eq "write_state without a state dir writes nothing" "$([ -e "$tmp/nowhere" ] && echo yes || echo no)" "no"
 
 STATE_DIR="$tmp/omarchy-zmk/E2_D9"
 
 # End-to-end runs. Every case shares a busctl stub location and an
 # unconditional notification stub, and gets its own runtime dir so state
-# from one case never leaks into the next.
+# from one case never leaks into the next. The script is sourced in a
+# subshell and its inputs reassigned before main runs, the same way the
+# unit tests above redirect it; set +u because the widget runs it without.
 : > "$tmp/empty-file"
 mkdir -p "$tmp/empty"
+e2e_path="$tmp/bin:/usr/bin:/bin"
 
 run_e2e() {
 	local name="$1" fixture_arg="$2" usbdir="$3" hiddir="$4"
 	shift 4
 	local rt="$tmp/rt-$name"
-	mkdir -p "$rt"
-	ZMK_STATUS_PATH="$tmp/bin:/usr/bin:/bin" \
-		ZMK_NOTIFY_CMD="$tmp/bin/omarchy-notification-send" \
-		XDG_RUNTIME_DIR="$rt" \
-		INPUT_DEVICES_FILE="$tmp/empty-file" \
-		BLUEZ_OBJECTS_FILE="$fixture_arg" \
-		USB_DEVICES_DIR="$usbdir" \
-		HID_DEVICES_DIR="$hiddir" \
-		bash "$here/../script/zmk-status" "$@" > "$tmp/out.json"
+	(umask 077; mkdir -p "$rt")
+	(
+		set +u
+		source "$here/../script/zmk-status" "$@"
+		PATH="$e2e_path"
+		NOTIFY_CMD="$tmp/bin/omarchy-notification-send"
+		RUNTIME_DIR="$rt"
+		STATE_ROOT="$rt/omarchy-zmk"
+		INPUT_DEVICES_FILE="$tmp/empty-file"
+		BLUEZ_OBJECTS_FILE="$fixture_arg"
+		USB_DEVICES_DIR="$usbdir"
+		HID_DEVICES_DIR="$hiddir"
+		main
+	) > "$tmp/out.json"
 }
 
 # Every end-to-end case asserts against the same output file. -c so an
@@ -310,7 +337,7 @@ case "$*" in
 esac
 STUB
 jq 'del(.data[0]["/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0015/char0016/desc001a"]["org.bluez.GattDescriptor1"].Value)' "$fixture" > "$tmp/tamperfix.json"
-mkdir -p "$tmp/rt-tamper/omarchy-zmk/E2_D9_27_00_00_AA"
+(umask 077; mkdir -p "$tmp/rt-tamper/omarchy-zmk/E2_D9_27_00_00_AA")
 printf '%s' 'Peripheral 0","injected":"yes' > "$tmp/rt-tamper/omarchy-zmk/E2_D9_27_00_00_AA/bat2.label"
 run_e2e "tamper" "$tmp/tamperfix.json" "$tmp/empty" "$tmp/empty" "" 1D50:615E 15 10
 assert_json_valid "e2e tampered label cache json valid"
@@ -354,7 +381,7 @@ run_e2e "cableonly" "$tmp/nodevice.json" "$tmp/usb" "$tmp/hid" "" 1D50:615E 15 1
 assert_json "cable only found" .found "true"
 assert_json "cable only address empty" .address ""
 assert_json "cable only tooltip" .tooltip "ZMK keyboard · Wired"
-assert_eq "cable only no state subdirs" "$(find "$tmp/rt-cableonly/omarchy-zmk" -mindepth 1 | wc -l)" "0"
+assert_eq "cable only no state dir" "$([ -e "$tmp/rt-cableonly/omarchy-zmk" ] && echo yes || echo no)" "no"
 
 stub_busctl_level93
 rm -f "$tmp/notify.log"
@@ -424,7 +451,7 @@ assert_json "pinned no match tooltip" .tooltip "no paired board at 00:11:22:33:4
 # of guessed at, since the rest of main can't build normal output without
 # them. Each stub PATH holds only symlinks to real system tools, standing
 # in for a host where one dependency was never installed.
-dep_tools="bash awk grep tr mv find date cat head tail sort mkdir rm timeout sed cut wc id printf env"
+dep_tools="bash awk grep tr mv find date cat head tail sort mkdir rm timeout sed cut wc printf env stat mktemp"
 
 mkdir -p "$tmp/bin-nojq"
 for t in $dep_tools; do
@@ -435,32 +462,21 @@ cat > "$tmp/bin-nojq/busctl" <<'STUB'
 exit 1
 STUB
 chmod +x "$tmp/bin-nojq/busctl"
-mkdir -p "$tmp/rt-nojq"
-ZMK_STATUS_PATH="$tmp/bin-nojq" \
-	XDG_RUNTIME_DIR="$tmp/rt-nojq" \
-	INPUT_DEVICES_FILE="$tmp/empty-file" \
-	BLUEZ_OBJECTS_FILE="$fixture" \
-	USB_DEVICES_DIR="$tmp/empty" \
-	HID_DEVICES_DIR="$tmp/empty" \
-	bash "$here/../script/zmk-status" "" 1D50:615E 15 10 > "$tmp/out-nojq.json"
-assert_eq "jq missing error" "$(/usr/bin/jq -r .error "$tmp/out-nojq.json")" "jq missing"
-assert_eq "jq missing tooltip" "$(/usr/bin/jq -r .tooltip "$tmp/out-nojq.json")" "ZMK: jq missing"
+e2e_path="$tmp/bin-nojq"
+run_e2e "nojq" "$fixture" "$tmp/empty" "$tmp/empty" "" 1D50:615E 15 10
+assert_eq "jq missing error" "$(/usr/bin/jq -r .error "$tmp/out.json")" "jq missing"
+assert_eq "jq missing tooltip" "$(/usr/bin/jq -r .tooltip "$tmp/out.json")" "ZMK: jq missing"
 
 mkdir -p "$tmp/bin-nobusctl"
 for t in $dep_tools; do
 	[ -x "/usr/bin/$t" ] && ln -s "/usr/bin/$t" "$tmp/bin-nobusctl/$t"
 done
 ln -s /usr/bin/jq "$tmp/bin-nobusctl/jq"
-mkdir -p "$tmp/rt-nobusctl"
-ZMK_STATUS_PATH="$tmp/bin-nobusctl" \
-	XDG_RUNTIME_DIR="$tmp/rt-nobusctl" \
-	INPUT_DEVICES_FILE="$tmp/empty-file" \
-	BLUEZ_OBJECTS_FILE="$fixture" \
-	USB_DEVICES_DIR="$tmp/empty" \
-	HID_DEVICES_DIR="$tmp/empty" \
-	bash "$here/../script/zmk-status" "" 1D50:615E 15 10 > "$tmp/out-nobusctl.json"
-assert_eq "busctl missing error" "$(/usr/bin/jq -r .error "$tmp/out-nobusctl.json")" "busctl missing"
-assert_eq "busctl missing found" "$(/usr/bin/jq -r .found "$tmp/out-nobusctl.json")" "false"
+e2e_path="$tmp/bin-nobusctl"
+run_e2e "nobusctl" "$fixture" "$tmp/empty" "$tmp/empty" "" 1D50:615E 15 10
+assert_eq "busctl missing error" "$(/usr/bin/jq -r .error "$tmp/out.json")" "busctl missing"
+assert_eq "busctl missing found" "$(/usr/bin/jq -r .found "$tmp/out.json")" "false"
+e2e_path="$tmp/bin:/usr/bin:/bin"
 
 # Caps: BlueZ is untrusted input, so battery instances, the alias, and the
 # whole document are all bounded before jq has to walk them.
@@ -480,5 +496,53 @@ assert_json "alias cap holds at 64" '.name | length' "64"
 head -c 3000000 /dev/zero | tr '\0' 'x' > "$tmp/huge-objects.json"
 run_e2e "hugeobjects" "$tmp/huge-objects.json" "$tmp/empty" "$tmp/empty" "" 1D50:615E 15 10
 assert_json "load_objects cap on a huge fixture" .error "BlueZ reply unreadable"
+
+# The runtime dir is shared by everything this user runs, so state is
+# refused, not redirected, when its directory is a symlink or readable by
+# anyone else. The board is still reported; only state goes dark.
+stub_busctl_level93
+mkdir -p "$tmp/elsewhere"
+(umask 077; mkdir -p "$tmp/rt-symlinkroot")
+ln -s "$tmp/elsewhere" "$tmp/rt-symlinkroot/omarchy-zmk"
+run_e2e "symlinkroot" "$fixture" "$tmp/empty" "$tmp/empty" "" 1D50:615E 15 10
+assert_json "symlinked state root is refused" .warning "runtime dir not private, state disabled"
+assert_json "symlinked state root still reports the board" .type "bluetooth"
+assert_json "symlinked state root still reads battery" '.batteries[1].value' "93"
+assert_eq "symlinked state root target gets no files" "$(find "$tmp/elsewhere" -mindepth 1 | wc -l)" "0"
+
+# A state root left world-readable by an earlier release is ours, so it is
+# tightened and used rather than refused.
+(umask 077; mkdir -p "$tmp/rt-loosedir/omarchy-zmk/E2_D9_27_00_00_AA")
+chmod 755 "$tmp/rt-loosedir/omarchy-zmk" "$tmp/rt-loosedir/omarchy-zmk/E2_D9_27_00_00_AA"
+run_e2e "loosedir" "$fixture" "$tmp/empty" "$tmp/empty" "" 1D50:615E 15 10
+assert_json "loose state root of ours is kept" .warning ""
+assert_eq "loose state root is tightened" "$(stat -c %a "$tmp/rt-loosedir/omarchy-zmk")" "700"
+assert_eq "loose state dir is tightened" "$(stat -c %a "$tmp/rt-loosedir/omarchy-zmk/E2_D9_27_00_00_AA")" "700"
+assert_eq "loose state dir gets state" "$([ -f "$tmp/rt-loosedir/omarchy-zmk/E2_D9_27_00_00_AA/lastseen" ] && echo yes || echo no)" "yes"
+
+run_e2e "privroot" "$fixture" "$tmp/empty" "$tmp/empty" "" 1D50:615E 15 10
+assert_eq "state root is created mode 700" "$(stat -c %a "$tmp/rt-privroot/omarchy-zmk")" "700"
+assert_eq "state dir is created mode 700" "$(stat -c %a "$tmp/rt-privroot/omarchy-zmk/E2_D9_27_00_00_AA")" "700"
+assert_eq "state files are created mode 600" "$(stat -c %a "$tmp/rt-privroot/omarchy-zmk/E2_D9_27_00_00_AA/lastseen")" "600"
+
+# A symlink planted at a state file name is neither read through nor
+# written through, and a garbage value in a real state file is ignored.
+(umask 077; mkdir -p "$tmp/rt-planted/omarchy-zmk/E2_D9_27_00_00_AA")
+victim_seen=$(( $(date +%s) - 7200 ))
+printf '%s\n' "$victim_seen" > "$tmp/victim-lastseen"
+ln -s "$tmp/victim-lastseen" "$tmp/rt-planted/omarchy-zmk/E2_D9_27_00_00_AA/lastseen"
+run_e2e "planted" "$tmp/disconnected.json" "$tmp/empty" "$tmp/empty" "E2:D9:27:00:00:AA" 1D50:615E 15 10
+assert_json "symlinked lastseen is not read" .lastseen ""
+run_e2e "planted" "$fixture" "$tmp/empty" "$tmp/empty" "E2:D9:27:00:00:AA" 1D50:615E 15 10
+assert_eq "symlinked lastseen target is untouched" "$(cat "$tmp/victim-lastseen")" "$victim_seen"
+assert_eq "symlinked lastseen replaced by a regular file" "$([ -f "$tmp/rt-planted/omarchy-zmk/E2_D9_27_00_00_AA/lastseen" ] && [ ! -L "$tmp/rt-planted/omarchy-zmk/E2_D9_27_00_00_AA/lastseen" ] && echo yes || echo no)" "yes"
+
+(umask 077; mkdir -p "$tmp/rt-garbage/omarchy-zmk/E2_D9_27_00_00_AA")
+printf 'not a number\n' > "$tmp/rt-garbage/omarchy-zmk/E2_D9_27_00_00_AA/lastseen"
+printf 'rm -rf /\n' > "$tmp/rt-garbage/omarchy-zmk/E2_D9_27_00_00_AA/devid"
+run_e2e "garbage" "$tmp/disconnected.json" "$tmp/empty" "$tmp/empty" "E2:D9:27:00:00:AA" 1D50:615E 15 10
+assert_json "garbage lastseen is ignored" .lastseen ""
+assert_json "garbage devid cache is ignored" .devid ""
+assert_json_valid "garbage state still yields valid json"
 
 if [ "$fails" -eq 0 ]; then echo "all tests passed"; else echo "$fails failing"; exit 1; fi

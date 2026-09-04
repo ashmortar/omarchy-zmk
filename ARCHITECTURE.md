@@ -95,7 +95,7 @@ script/zmk-status
   busctl: one ObjectManager call for every BlueZ fact, plus one GATT read per battery
   sysfs for USB and HID
   one timeout-bounded evdev reader for both keyboard nodes
-  $XDG_RUNTIME_DIR/omarchy-zmk/<MAC>/ for state
+  /run/user/<uid>/omarchy-zmk/<MAC>/ for state
 ```
 
 The widget owns presentation and settings. The script owns every fact and
@@ -107,7 +107,13 @@ from a terminal. The two meet only at that JSON line.
 Every external call, script and widget alike, runs under a TERM-then-KILL
 deadline. The BlueZ document is capped at 2 MB, battery instances at 8,
 and the name at 64 characters. The widget rejects an output line over
-64 KB. The script resolves every binary it runs from a fixed PATH.
+64 KB.
+
+The script reads nothing from its environment. PATH is fixed to `/usr/bin`
+and `/bin`, the notification command and every input path are literals,
+and the runtime directory is `/run/user/<uid>` by name rather than
+`$XDG_RUNTIME_DIR`. The tests get their fixtures in by sourcing the script
+and reassigning those variables, not by exporting anything.
 
 ### Polling, not events
 
@@ -156,9 +162,25 @@ says why the keystroke path can't be told apart.
 ### State directory
 
 Everything the script keeps between runs lives under
-`$XDG_RUNTIME_DIR/omarchy-zmk/<MAC>/`: battery labels, drain history,
+`/run/user/<uid>/omarchy-zmk/<MAC>/`: battery labels, drain history,
 notification flags, keystroke stamps, the reader's pid, and the cached
 device id. Two boards never share a directory.
+
+The runtime directory is private to the user, but every process the user
+runs shares it, so the script treats it with some suspicion. Each level,
+`/run/user/<uid>`, `omarchy-zmk`, and the per-board directory, has to be a
+real directory (not a symlink) owned by the user with mode 700, or state
+is disabled for that run with a warning and the board is still reported.
+Every state read first checks that the name is a regular file owned by
+the user and not a symlink, and every value read back is validated
+against the shape the script writes (a number, a `VID:PID vX.Y`, a
+sanitized label) before it is used. Every write goes to a `mktemp` name
+in the same directory and is renamed into place, so a symlink planted at
+a state name is replaced rather than written through, and a poll killed
+mid-write leaves the previous file whole. Deletes use `rm` on the name,
+which never follows a link. The keystroke reader applies the same rules
+from Python: it checks the directory with `lstat` before it starts and
+writes each stamp through `mkstemp` and `os.replace`.
 
 ### Multiple bars
 
@@ -207,9 +229,48 @@ Inline on the shell.json layout entry, all optional.
 ## Testing
 
 `tests/test-script.sh` covers the script's pure functions and runs it end
-to end against a fixture. The script takes its inputs from environment
-variables so the tests never touch the real machine:
-`BLUEZ_OBJECTS_FILE` replaces the D-Bus document, `INPUT_DEVICES_FILE`
-replaces `/proc/bus/input/devices`, and `USB_DEVICES_DIR` and
-`HID_DEVICES_DIR` replace the two sysfs trees. `omarchy plugin validate .`
-runs the same manifest checks the shell enforces.
+to end against a fixture. Sourcing the script defines its functions
+without running `main`, and the tests then reassign its input variables
+so nothing touches the real machine: `BLUEZ_OBJECTS_FILE` replaces the
+D-Bus document, `INPUT_DEVICES_FILE` replaces `/proc/bus/input/devices`,
+`USB_DEVICES_DIR` and `HID_DEVICES_DIR` replace the two sysfs trees,
+`RUNTIME_DIR` and `STATE_ROOT` point state at a temp dir, `PATH` points
+at a directory of stubs, and `NOTIFY_CMD` at a stub that logs. The
+end-to-end cases do the same inside a subshell and then call `main`. The
+fixture `tests/fixtures/bluez-objects.json` is a real capture with a
+synthetic address. `omarchy plugin validate .` runs the same manifest
+checks the shell enforces.
+
+## Developing
+
+```bash
+tests/test-script.sh          # must end with "all tests passed"
+shellcheck -s bash script/zmk-status tests/test-script.sh
+bash -n script/zmk-status
+omarchy plugin validate .
+```
+
+Some rules that aren't obvious from the code:
+
+- Tabs in the bash script, two spaces in QML. The python inside the
+  script's heredoc is indented with tabs (stripped by `<<-`) followed by
+  spaces for python's own indentation.
+- Every external call in the script runs under `timeout`. The widget's
+  watchdog is 30 seconds; the script must finish well inside it.
+- Never call `bluetoothctl`. It aborts inside libdbus when BlueZ's object
+  tree changes under it, and every abort raises a crash notification.
+  Everything it offered is available over `busctl`.
+- The JSON keys the script prints are a contract with the widget. Add
+  keys if you must; don't rename or drop any.
+- The widget is built on the shell's own `qs.Ui` components, which
+  third-party plugins can import. Don't hand-roll popups or buttons.
+
+When this directory is the live plugin, the shell hot-reloads on every
+save, and that reload sometimes wedges silently and keeps the old widget
+instance alive. After editing, run `omarchy restart shell`, wait a few
+seconds, then check the journal for a `Plugin widget ashmortar.zmk
+failed:` line:
+
+```bash
+journalctl --user --since "-20s" --no-pager -q | grep -i -E 'Plugin widget|ashmortar' | grep -v DEBUG
+```
