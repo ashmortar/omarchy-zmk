@@ -1,0 +1,19 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get install -y --no-install-recommends shellcheck jq
+      - run: shellcheck -x -P SCRIPTDIR -s bash script/zmk-status tests/test-script.sh
+      - run: bash -n script/zmk-status
+      - run: tests/test-script.sh

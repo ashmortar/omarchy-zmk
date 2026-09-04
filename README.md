@@ -27,9 +27,10 @@ Everything here ships with a stock Omarchy install:
   can't open the keyboard's event nodes
 
 The script checks for `jq`, `busctl`, and `timeout` at each run and
-reports a missing one in the popup instead of guessing; it runs only
-system binaries from the standard directories, never anything from your
-shell's PATH.
+reports a missing one in the popup instead of guessing. It reads nothing
+from the environment: binaries come from `/usr/bin` only, never from your
+shell's PATH, and its state lives under `/run/user/<uid>/omarchy-zmk/`,
+which it uses only while that directory is private to you.
 
 ## Usage
 
@@ -84,8 +85,8 @@ omarchy plugin remove ashmortar.zmk    # delete the plugin
 ```
 
 Outside its own directory the widget writes two things: runtime state
-under `$XDG_RUNTIME_DIR/omarchy-zmk/`, which the system clears at
-logout, and its own bar entry in `~/.config/omarchy/shell.json` when you
+under `/run/user/<uid>/omarchy-zmk/`, which the system clears at logout,
+and its own bar entry in `~/.config/omarchy/shell.json` when you
 right-click to toggle percentages.
 
 ## How it works
