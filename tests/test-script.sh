@@ -189,7 +189,7 @@ assert_eq "pnp_char bytes" "$(pnp_char "$objects" /org/bluez/hci0/dev_E2_D9_27_0
 # the descriptor path in place.
 jq 'del(.data[0]["/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0015/char0016/desc001a"]["org.bluez.GattDescriptor1"].Value)' "$fixture" > "$tmp/nodesc.json"
 nodesc_objects=$(cat "$tmp/nodesc.json")
-IFS=$'\x1f' read -r nodesc_char nodesc_raw nodesc_desc_path <<<"$(battery_chars "$nodesc_objects" /org/bluez/hci0/dev_E2_D9_27_00_00_AA | sed -n 2p)"
+IFS=$'\x1f' read -r _ nodesc_raw nodesc_desc_path <<<"$(battery_chars "$nodesc_objects" /org/bluez/hci0/dev_E2_D9_27_00_00_AA | sed -n 2p)"
 assert_eq "battery_chars missing descriptor value keeps raw empty" "$nodesc_raw" ""
 assert_eq "battery_chars missing descriptor value keeps path" "$nodesc_desc_path" "/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0015/char0016/desc001a"
 
@@ -243,6 +243,7 @@ run_e2e() {
 	(umask 077; mkdir -p "$rt")
 	(
 		set +u
+		# shellcheck source=../script/zmk-status
 		source "$here/../script/zmk-status" "$@"
 		PATH="$e2e_path"
 		NOTIFY_CMD="$tmp/bin/omarchy-notification-send"
@@ -375,6 +376,17 @@ assert_json "wired ble battery0 charging" '.batteries[0].charging' "true"
 assert_json "wired ble battery1 charging" '.batteries[1].charging' "false"
 assert_json "wired ble text" .text '󰌌 C:chg P:93'
 assert_eq "wired ble tooltip second line" "$(jq -r .tooltip "$tmp/out.json" | sed -n 2p)" "Central charging · Peripheral 93%"
+
+# Regression: with three instances the peripheral count was computed in
+# the same local statement as the instance count, before that count had
+# taken effect, so it was always 0 and a cable on one of two peripherals
+# flagged both as charging.
+jq '.data[0]["/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0015/char0030"] = {"org.bluez.GattCharacteristic1":{"UUID":{"type":"s","data":"00002a19-0000-1000-8000-00805f9b34fb"}}}
+	| .data[0]["/org/bluez/hci0/dev_E2_D9_27_00_00_AA/service0015/char0030/desc0031"] = {"org.bluez.GattDescriptor1":{"UUID":{"type":"s","data":"00002901-0000-1000-8000-00805f9b34fb"},"Value":{"type":"ay","data":[80,101,114,105,112,104,101,114,97,108,32,49]}}}' "$fixture" > "$tmp/threepiece.json"
+run_e2e "threepiece" "$tmp/threepiece.json" "$tmp/usb" "$tmp/empty" "" 1D50:615E 15 10
+assert_json "three piece instance count" '.batteries | length' "3"
+assert_json "three piece names" '[.batteries[].name] | join(",")' "Central,Peripheral 0,Peripheral 1"
+assert_json "three piece cabled peripheral is ambiguous" '[.batteries[].charging] | join(",")' "false,false,false"
 
 jq 'del(.data[0]["/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01"]) | del(.data[0]["/org/bluez/hci0/dev_E2_D9_27_00_00_AA"])' "$fixture" > "$tmp/nodevice.json"
 run_e2e "cableonly" "$tmp/nodevice.json" "$tmp/usb" "$tmp/hid" "" 1D50:615E 15 10

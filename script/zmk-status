@@ -601,7 +601,8 @@ main() {
 	if [ "$ble_connected" = "yes" ]; then
 		local -a rows=()
 		mapfile -t rows < <(battery_chars "$objects" "$ZMK_PATH")
-		local count=${#rows[@]} peripherals=$((count > 1 ? count - 1 : 0))
+		local count=${#rows[@]}
+		local peripherals=$((count > 1 ? count - 1 : 0))
 		local i char slot raw desc_path label name_long role value charging eta_hours eta bar_readout tooltip_readout
 		for i in "${!rows[@]}"; do
 			IFS=$'\x1f' read -r char raw desc_path <<<"${rows[$i]}"

@@ -245,7 +245,7 @@ checks the shell enforces.
 
 ```bash
 tests/test-script.sh          # must end with "all tests passed"
-shellcheck -s bash script/zmk-status tests/test-script.sh
+shellcheck -x -s bash script/zmk-status tests/test-script.sh
 bash -n script/zmk-status
 omarchy plugin validate .
 ```
