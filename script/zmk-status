@@ -83,11 +83,11 @@ read_state() {
 # into place: rename replaces a planted symlink instead of writing through
 # it, and a poll killed mid-write leaves the previous file whole.
 write_state() {
-	local file="$1" tmp
+	local file="$1" staging
 	[ -n "$STATE_DIR" ] || { cat >/dev/null; return 1; }
-	tmp=$(mktemp -- "$STATE_DIR/.tmp.XXXXXX") || { cat >/dev/null; return 1; }
-	if cat > "$tmp" && mv -f -T -- "$tmp" "$file" 2>/dev/null; then return 0; fi
-	rm -f -- "$tmp"
+	staging=$(mktemp -- "$STATE_DIR/.tmp.XXXXXX") || { cat >/dev/null; return 1; }
+	if cat > "$staging" && mv -f -T -- "$staging" "$file" 2>/dev/null; then return 0; fi
+	rm -f -- "$staging"
 	return 1
 }
 
